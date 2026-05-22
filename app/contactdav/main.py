@@ -363,6 +363,7 @@ def register_routes(app: Flask) -> None:
         return redirect(url_for("admin_contacts"))
 
     @app.route("/dav", defaults={"subpath": ""}, methods=["OPTIONS", "GET", "HEAD", "PROPFIND", "REPORT", "PUT", "DELETE"])
+    @app.route("/dav/", defaults={"subpath": ""}, methods=["OPTIONS", "GET", "HEAD", "PROPFIND", "REPORT", "PUT", "DELETE"])
     @app.route("/dav/<path:subpath>", methods=["OPTIONS", "GET", "HEAD", "PROPFIND", "REPORT", "PUT", "DELETE"])
     def dav(subpath: str):
         user, error = require_user()
