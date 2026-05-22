@@ -1,0 +1,27 @@
+services:
+  contacts:
+    build: .
+    container_name: company-contacts
+    restart: unless-stopped
+    environment:
+      CONTACT_DOMAIN: ${CONTACT_DOMAIN:-}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+      CONTACT_ADMIN_USER: ${CONTACT_ADMIN_USER:-admin}
+      CONTACT_ADMIN_PASSWORD: ${CONTACT_ADMIN_PASSWORD:?Set CONTACT_ADMIN_PASSWORD in .env before starting}
+      CONTACT_EMPLOYEE_USER: ${CONTACT_EMPLOYEE_USER:-}
+      CONTACT_EMPLOYEE_PASSWORD: ${CONTACT_EMPLOYEE_PASSWORD:-}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8080:8080"
+    volumes:
+      - contacts-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  contacts-data:
+    name: company-contacts-data
