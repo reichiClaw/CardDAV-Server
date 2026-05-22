@@ -97,6 +97,241 @@ From the admin UI you can:
 - create employee read-only users
 - create additional admins
 
+
+## Install behind an existing reverse proxy
+
+Use this mode if you already have nginx, Traefik, Caddy, Apache, Nginx Proxy
+Manager, Cloudflare Tunnel, or another reverse proxy on the host.
+
+In this setup the external reverse proxy handles the public HTTPS certificate.
+The contacts container only listens on local HTTP port `8080`.
+
+```text
+iPhone / Android
+      |
+      | https://contacts.example.com
+      v
+Existing reverse proxy with trusted certificate
+      |
+      | http://127.0.0.1:8080
+      v
+company-contacts container
+```
+
+### 1. DNS and certificate
+
+Point DNS to the server or tunnel endpoint that runs your reverse proxy:
+
+```text
+contacts.example.com  A  <reverse-proxy-public-ip>
+```
+
+Your reverse proxy must serve a publicly trusted certificate for exactly the
+same hostname that users enter on the phone:
+
+```text
+contacts.example.com
+```
+
+For iOS, first test this in Safari on the phone:
+
+```text
+https://contacts.example.com/admin
+```
+
+If Safari shows a certificate warning, CardDAV sync will usually fail too.
+Fix the certificate before configuring the Contacts account.
+
+### 2. Configure `.env` for reverse-proxy mode
+
+Leave `CONTACT_DOMAIN` empty. This disables the container's public HTTPS mode
+and makes the included Caddy listen on plain HTTP port `8080` instead.
+
+```bash
+CONTACT_DOMAIN=
+ACME_EMAIL=
+CONTACT_ADMIN_USER=admin
+CONTACT_ADMIN_PASSWORD=replace-with-a-long-random-password
+CONTACT_EMPLOYEE_USER=employee
+CONTACT_EMPLOYEE_PASSWORD=replace-with-another-long-random-password
+```
+
+### 3. Bind the container only to localhost
+
+For a reverse-proxy installation, expose only local port `8080` and do not
+publish container ports `80` and `443` directly to the internet.
+
+Edit `docker-compose.yml` ports to look like this:
+
+```yaml
+ports:
+  - "127.0.0.1:8080:8080"
+```
+
+Remove or comment these lines in reverse-proxy mode:
+
+```yaml
+# - "80:80"
+# - "443:443"
+```
+
+Then start the container:
+
+```bash
+docker compose up -d --build
+```
+
+Test from the server itself:
+
+```bash
+curl -I http://127.0.0.1:8080/health
+```
+
+Expected result:
+
+```text
+HTTP/1.1 200 OK
+```
+
+### 4. Reverse proxy requirements
+
+The reverse proxy must:
+
+- proxy the site at the domain root, not under a subpath
+- forward all paths unchanged, especially `/dav/`
+- allow WebDAV/CardDAV methods: `OPTIONS`, `GET`, `HEAD`, `PROPFIND`, `REPORT`,
+  `PUT`, and `DELETE`
+- forward the `Authorization` header for Basic Auth
+- keep HTTPS enabled on the public side
+- avoid changing or stripping trailing slashes
+
+Use this public URL:
+
+```text
+https://contacts.example.com
+```
+
+Do not publish it as:
+
+```text
+https://example.com/contacts
+```
+
+CardDAV clients, especially iOS, are more reliable when the service is mounted
+at the domain root.
+
+### 5. nginx example
+
+```nginx
+server {
+    listen 80;
+    server_name contacts.example.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name contacts.example.com;
+
+    ssl_certificate /etc/letsencrypt/live/contacts.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/contacts.example.com/privkey.pem;
+
+    client_max_body_size 20m;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Authorization $http_authorization;
+    }
+}
+```
+
+Reload nginx after changing the config:
+
+```bash
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+### 6. Caddy reverse proxy example
+
+This is for an external Caddy instance on the host, not the Caddy inside the
+container.
+
+```caddyfile
+contacts.example.com {
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+Caddy will automatically issue and renew the public certificate.
+
+### 7. Traefik example labels
+
+If Traefik is your public reverse proxy, remove direct `ports:` from the
+contacts service and attach it to the Traefik network. Example labels:
+
+```yaml
+labels:
+  - "traefik.enable=true"
+  - "traefik.http.routers.company-contacts.rule=Host(`contacts.example.com`)"
+  - "traefik.http.routers.company-contacts.entrypoints=websecure"
+  - "traefik.http.routers.company-contacts.tls.certresolver=letsencrypt"
+  - "traefik.http.services.company-contacts.loadbalancer.server.port=8080"
+```
+
+### 8. Nginx Proxy Manager checklist
+
+In Nginx Proxy Manager create a new Proxy Host:
+
+```text
+Domain Names: contacts.example.com
+Scheme: http
+Forward Hostname / IP: host.docker.internal or the Docker host IP
+Forward Port: 8080
+Websockets Support: optional
+Block Common Exploits: off if PROPFIND/REPORT are blocked
+SSL Certificate: request a new Let's Encrypt certificate
+Force SSL: on
+HTTP/2 Support: on
+```
+
+If Nginx Proxy Manager runs in Docker on Linux, `127.0.0.1` points to the NPM
+container itself, not the Docker host. Use one of these instead:
+
+- the Docker host LAN IP
+- a shared Docker network and the service name `company-contacts`
+- `host.docker.internal` if configured for your Docker installation
+
+### 9. Reverse-proxy troubleshooting for iOS
+
+Check from a computer:
+
+```bash
+curl -I https://contacts.example.com/health
+curl -u employee:employee-password -X PROPFIND https://contacts.example.com/dav/ -H 'Depth: 1'
+```
+
+The first command should return `200 OK`. The second should return `207
+MULTI-STATUS` after successful authentication.
+
+If iOS still fails:
+
+1. Open `https://contacts.example.com/admin` in Safari on the iPhone and confirm
+   there is no certificate warning.
+2. Confirm the reverse proxy forwards `Authorization`.
+3. Confirm `PROPFIND` and `REPORT` are not blocked by a WAF/security rule.
+4. Confirm the service is mounted at `/`, not a subpath.
+5. Confirm the public URL redirects HTTP to HTTPS, but does not redirect
+   `/dav/` to another hostname.
+6. Check container logs with `docker compose logs -f contacts` while adding the
+   CardDAV account on the phone.
+
 ## iPhone / iPad setup
 
 On iOS:
