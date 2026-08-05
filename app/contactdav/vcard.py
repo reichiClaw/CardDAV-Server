@@ -28,12 +28,26 @@ def escape_value(value: str | None) -> str:
 
 
 def unescape_value(value: str) -> str:
-    return (
-        value.replace("\\n", "\n")
-        .replace("\\,", ",")
-        .replace("\\;", ";")
-        .replace("\\\\", "\\")
-    )
+    """Unescape vCard text values without corrupting literal backslashes."""
+    output: list[str] = []
+    index = 0
+    while index < len(value):
+        char = value[index]
+        if char == "\\" and index + 1 < len(value):
+            nxt = value[index + 1]
+            if nxt == "n":
+                output.append("\n")
+            elif nxt == "N":
+                output.append("\n")
+            elif nxt in {",", ";", "\\"}:
+                output.append(nxt)
+            else:
+                output.append(nxt)
+            index += 2
+            continue
+        output.append(char)
+        index += 1
+    return "".join(output)
 
 
 def fold_line(line: str) -> list[str]:

@@ -13,7 +13,8 @@ services:
     ports:
       - "80:80"
       - "443:443"
-      - "8080:8080"
+      # Local/reverse-proxy mode only; bound to loopback so plaintext HTTP is not public.
+      - "127.0.0.1:8080:8080"
     volumes:
       - contacts-data:/data
     healthcheck:
@@ -21,6 +22,7 @@ services:
       interval: 30s
       timeout: 5s
       retries: 5
+      start_period: 20s
 
 volumes:
   contacts-data:
