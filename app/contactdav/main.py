@@ -4,16 +4,16 @@ import csv
 import hmac
 import io
 import os
+import sqlite3
 from functools import wraps
 from hashlib import sha256
-from pathlib import Path
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlparse
 from xml.etree import ElementTree as ET
 
-from flask import Flask, Response, abort, make_response, redirect, render_template_string, request, url_for
+from flask import Flask, Response, abort, redirect, render_template_string, request, url_for
 
 from .security import data_dir
-from .storage import CONTACT_FIELDS, Store
+from .storage import CONTACT_FIELDS, Store, normalize_uid
 from .vcard import contact_to_vcard, etag_for_vcard, parse_vcard
 
 D = "DAV:"
@@ -23,6 +23,11 @@ CS = "http://calendarserver.org/ns/"
 ET.register_namespace("D", D)
 ET.register_namespace("C", C)
 ET.register_namespace("CS", CS)
+
+MAX_BODY_BYTES = 2 * 1024 * 1024
+READ_METHODS = "OPTIONS, GET, HEAD, PROPFIND, REPORT"
+WRITE_METHODS = "PUT, DELETE"
+DAV_COMPLIANCE = "1, addressbook"
 
 
 def q(namespace: str, name: str) -> str:
@@ -45,6 +50,7 @@ store.bootstrap_from_env()
 def create_app() -> Flask:
     app = Flask(__name__)
     app.config["SECRET_KEY"] = load_secret_key()
+    app.config["MAX_CONTENT_LENGTH"] = MAX_BODY_BYTES
     register_routes(app)
     return app
 
@@ -54,11 +60,14 @@ def load_secret_key() -> str:
     if configured:
         return configured
     path = data_dir() / "secret.key"
-    if path.exists():
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        secret = os.urandom(32).hex()
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(secret)
+        return secret
+    except FileExistsError:
         return path.read_text(encoding="utf-8").strip()
-    secret = os.urandom(32).hex()
-    path.write_text(secret, encoding="utf-8")
-    return secret
 
 
 def auth_challenge() -> Response:
@@ -140,9 +149,24 @@ def href_property(tag: str, target: str) -> ET.Element:
     return element
 
 
+def privilege_set(role: str) -> ET.Element:
+    element = ET.Element(q(D, "current-user-privilege-set"))
+    names = ["read", "read-current-user-privilege-set"]
+    if role == "admin":
+        names.extend(["write", "write-properties", "write-content", "bind", "unbind"])
+    for name in names:
+        privilege = ET.SubElement(element, q(D, "privilege"))
+        ET.SubElement(privilege, q(D, name))
+    return element
+
+
 def supported_report_set() -> ET.Element:
     element = ET.Element(q(D, "supported-report-set"))
-    for namespace, name in [(C, "addressbook-query"), (C, "addressbook-multiget")]:
+    for namespace, name in [
+        (C, "addressbook-query"),
+        (C, "addressbook-multiget"),
+        (D, "sync-collection"),
+    ]:
         supported = ET.SubElement(element, q(D, "supported-report"))
         report = ET.SubElement(supported, q(D, "report"))
         ET.SubElement(report, q(namespace, name))
@@ -155,6 +179,20 @@ def supported_address_data() -> ET.Element:
     child.set("content-type", "text/vcard")
     child.set("version", "3.0")
     return element
+
+
+def allow_header(role: str) -> str:
+    if role == "admin":
+        return f"{READ_METHODS}, {WRITE_METHODS}"
+    return READ_METHODS
+
+
+def dav_options(role: str) -> Response:
+    response = Response("", 204)
+    response.headers["DAV"] = DAV_COMPLIANCE
+    response.headers["Allow"] = allow_header(role)
+    response.headers["MS-Author-Via"] = "DAV"
+    return response
 
 
 def parse_requested_props() -> set[str] | None:
@@ -202,17 +240,25 @@ def response_for(href_value: str, available: dict[str, ET.Element], requested: s
     return response
 
 
-def root_props(username: str) -> dict[str, ET.Element]:
+def not_found_response(href_value: str) -> ET.Element:
+    response = ET.Element(q(D, "response"))
+    response.append(href(href_value))
+    ET.SubElement(response, q(D, "status")).text = "HTTP/1.1 404 Not Found"
+    return response
+
+
+def root_props(username: str, role: str) -> dict[str, ET.Element]:
     principal = f"/dav/{quote(username)}/"
     return {
         q(D, "resourcetype"): resourcetype("collection"),
         q(D, "displayname"): prop_element(q(D, "displayname"), "Company Contacts DAV"),
         q(D, "current-user-principal"): href_property(q(D, "current-user-principal"), principal),
         q(D, "principal-collection-set"): href_property(q(D, "principal-collection-set"), "/dav/"),
+        q(D, "current-user-privilege-set"): privilege_set(role),
     }
 
 
-def principal_props(username: str) -> dict[str, ET.Element]:
+def principal_props(username: str, role: str) -> dict[str, ET.Element]:
     principal = f"/dav/{quote(username)}/"
     return {
         q(D, "resourcetype"): resourcetype("collection", "principal"),
@@ -220,10 +266,11 @@ def principal_props(username: str) -> dict[str, ET.Element]:
         q(D, "principal-URL"): href_property(q(D, "principal-URL"), principal),
         q(C, "addressbook-home-set"): href_property(q(C, "addressbook-home-set"), principal),
         q(D, "current-user-principal"): href_property(q(D, "current-user-principal"), principal),
+        q(D, "current-user-privilege-set"): privilege_set(role),
     }
 
 
-def collection_props(username: str) -> dict[str, ET.Element]:
+def collection_props(username: str, role: str) -> dict[str, ET.Element]:
     token = store.collection_token()
     return {
         q(D, "resourcetype"): resourcetype("collection", "addressbook"),
@@ -233,49 +280,108 @@ def collection_props(username: str) -> dict[str, ET.Element]:
         q(D, "owner"): href_property(q(D, "owner"), f"/dav/{quote(username)}/"),
         q(D, "supported-report-set"): supported_report_set(),
         q(C, "supported-address-data"): supported_address_data(),
+        q(D, "current-user-privilege-set"): privilege_set(role),
     }
 
 
-def contact_props(contact: dict, include_card: bool = False) -> dict[str, ET.Element]:
+def contact_props(contact: dict, role: str, include_card: bool = False) -> dict[str, ET.Element]:
     vcard = contact_to_vcard(contact)
     props = {
         q(D, "resourcetype"): resourcetype(),
         q(D, "getetag"): prop_element(q(D, "getetag"), etag_for_vcard(vcard)),
         q(D, "getcontenttype"): prop_element(q(D, "getcontenttype"), "text/vcard; charset=utf-8"),
         q(D, "getcontentlength"): prop_element(q(D, "getcontentlength"), str(len(vcard.encode("utf-8")))),
+        q(D, "current-user-privilege-set"): privilege_set(role),
     }
     if include_card:
         props[q(C, "address-data")] = prop_element(q(C, "address-data"), vcard)
     return props
 
 
-def split_dav_path(subpath: str) -> tuple[str, str | None]:
+def split_dav_path(subpath: str) -> tuple[str, str | None, str | None]:
     parts = [unquote(part) for part in subpath.split("/") if part]
     if not parts:
-        return "root", None
+        return "root", None, None
+    path_user = parts[0]
     if len(parts) == 1:
-        return "principal", None
+        return "principal", None, path_user
     if len(parts) == 2 and parts[1] == "contacts":
-        return "collection", None
+        return "collection", None, path_user
     if len(parts) == 3 and parts[1] == "contacts":
         uid = parts[2]
         if uid.endswith(".vcf"):
             uid = uid[:-4]
-        return "contact", uid
-    return "missing", None
+        return "contact", normalize_uid(uid), path_user
+    return "missing", None, path_user
 
 
 def contact_href(username: str, uid: str) -> str:
     return f"/dav/{quote(username)}/contacts/{quote(uid)}.vcf"
 
 
+def etag_matches(header_value: str, etag: str | None) -> bool:
+    if etag is None:
+        return False
+    candidates = [part.strip() for part in header_value.split(",") if part.strip()]
+    return any(candidate == "*" or candidate == etag for candidate in candidates)
+
+
+def check_write_preconditions(existed: bool, current_etag: str | None) -> Response | None:
+    if_match = request.headers.get("If-Match")
+    if_none_match = request.headers.get("If-None-Match")
+
+    if if_match is not None:
+        if if_match.strip() == "*":
+            if not existed:
+                return Response("Precondition Failed", 412)
+        elif not existed or not etag_matches(if_match, current_etag):
+            return Response("Precondition Failed", 412)
+
+    if if_none_match is not None:
+        if if_none_match.strip() == "*":
+            if existed:
+                return Response("Precondition Failed", 412)
+        elif existed and etag_matches(if_none_match, current_etag):
+            return Response("Precondition Failed", 412)
+    return None
+
+
+def uid_from_href(item: str) -> str | None:
+    path = urlparse(item).path if "://" in item else item
+    parts = [unquote(part) for part in path.split("/") if part]
+    if len(parts) < 3 or parts[0] != "dav" or parts[2] != "contacts":
+        return None
+    uid = parts[-1]
+    if uid.endswith(".vcf"):
+        uid = uid[:-4]
+    return normalize_uid(uid)
+
+
 def register_routes(app: Flask) -> None:
     @app.get("/health")
     def health() -> Response:
+        try:
+            store.revision()
+        except sqlite3.Error:
+            return Response("db unavailable\n", status=503, content_type="text/plain")
         return Response("ok\n", content_type="text/plain")
 
-    @app.get("/")
-    def index() -> Response:
+    @app.route("/.well-known/carddav", methods=["GET", "HEAD", "PROPFIND", "OPTIONS"])
+    def well_known_carddav():
+        return redirect("/dav/", code=301)
+
+    @app.route("/", methods=["GET", "HEAD", "OPTIONS", "PROPFIND"])
+    def index():
+        if request.method == "OPTIONS":
+            user = current_user()
+            if not user:
+                return auth_challenge()
+            return dav_options(user["role"])
+        if request.method == "PROPFIND":
+            user, error = require_user()
+            if error:
+                return error
+            return handle_propfind("root", None, user["username"], user["role"])
         return redirect(url_for("admin_contacts"))
 
     @app.route("/admin", methods=["GET"])
@@ -333,9 +439,18 @@ def register_routes(app: Flask) -> None:
 
     @app.route("/admin/users/<username>/delete", methods=["POST"])
     @require_admin
-    def delete_user(user: dict, username: str) -> Response:
+    def delete_user(user: dict, username: str):
         validate_csrf(user)
-        store.delete_user(username)
+        try:
+            store.delete_user(username)
+        except ValueError as exc:
+            return render_template_string(
+                USERS_TEMPLATE,
+                user=user,
+                csrf=csrf_token(user["username"]),
+                users=store.list_users(),
+                error=str(exc),
+            )
         return redirect(url_for("admin_users"))
 
     @app.route("/admin/export.csv", methods=["GET"])
@@ -358,8 +473,7 @@ def register_routes(app: Flask) -> None:
         validate_csrf(user)
         text = request.form.get("csv_data", "")
         reader = csv.DictReader(io.StringIO(text))
-        for row in reader:
-            store.save_contact(row)
+        store.save_contacts(list(reader))
         return redirect(url_for("admin_contacts"))
 
     @app.route("/dav", defaults={"subpath": ""}, methods=["OPTIONS", "GET", "HEAD", "PROPFIND", "REPORT", "PUT", "DELETE"])
@@ -370,30 +484,21 @@ def register_routes(app: Flask) -> None:
         if error:
             return error
         if request.method == "OPTIONS":
-            response = Response("", 204)
-            response.headers["DAV"] = "1, 2, 3, addressbook"
-            response.headers["Allow"] = "OPTIONS, GET, HEAD, PROPFIND, REPORT, PUT, DELETE"
-            response.headers["MS-Author-Via"] = "DAV"
-            return response
+            return dav_options(user["role"])
 
-        kind, uid = split_dav_path(subpath)
+        kind, uid, path_user = split_dav_path(subpath)
         username = user["username"]
+        role = user["role"]
+
+        if path_user is not None and path_user != username:
+            return Response("Not Found", 404)
 
         if request.method in {"PUT", "DELETE"}:
-            if user["role"] != "admin":
+            if role != "admin":
                 return Response("This address book is read-only for employee accounts", 403)
             if kind != "contact" or not uid:
                 return Response("Only contact resources can be changed", 409)
-            if request.method == "DELETE":
-                store.delete_contact(uid)
-                return Response("", 204)
-            data = parse_vcard(request.get_data(as_text=True), fallback_uid=uid)
-            existed = store.get_contact(data["uid"], include_inactive=True) is not None
-            saved_uid = store.save_contact(data)
-            vcard = contact_to_vcard(store.get_contact(saved_uid))
-            response = Response("", 204 if existed else 201)
-            response.headers["ETag"] = etag_for_vcard(vcard)
-            return response
+            return handle_write(uid, username, request.method)
 
         if request.method in {"GET", "HEAD"}:
             if kind == "contact" and uid:
@@ -403,13 +508,16 @@ def register_routes(app: Flask) -> None:
                 vcard = contact_to_vcard(contact)
                 response = Response("" if request.method == "HEAD" else vcard, content_type="text/vcard; charset=utf-8")
                 response.headers["ETag"] = etag_for_vcard(vcard)
+                response.headers["Allow"] = allow_header(role)
                 return response
-            return Response("", 200)
+            response = Response("", 200)
+            response.headers["Allow"] = allow_header(role)
+            return response
 
         if request.method == "PROPFIND":
-            return handle_propfind(kind, uid, username)
+            return handle_propfind(kind, uid, username, role)
         if request.method == "REPORT":
-            return handle_report(username)
+            return handle_report(username, role)
 
         abort(405)
 
@@ -418,29 +526,60 @@ def form_contact() -> dict:
     return {field: request.form.get(field, "") for field in CONTACT_FIELDS}
 
 
-def handle_propfind(kind: str, uid: str | None, username: str) -> Response:
+def handle_write(uid: str, username: str, method: str) -> Response:
+    existing = store.get_contact(uid)
+    existed = existing is not None
+    current_etag = etag_for_vcard(contact_to_vcard(existing)) if existing else None
+    precondition = check_write_preconditions(existed, current_etag)
+    if precondition:
+        return precondition
+
+    if method == "DELETE":
+        if not store.delete_contact(uid):
+            return Response("Not Found", 404)
+        return Response("", 204)
+
+    raw = request.get_data(as_text=True)
+    data = parse_vcard(raw, fallback_uid=uid)
+    data["uid"] = uid
+    saved_uid = store.save_contact(data)
+    vcard = contact_to_vcard(store.get_contact(saved_uid))
+    response = Response("", 204 if existed else 201)
+    response.headers["ETag"] = etag_for_vcard(vcard)
+    if not existed:
+        response.headers["Location"] = contact_href(username, saved_uid)
+    return response
+
+
+def handle_propfind(kind: str, uid: str | None, username: str, role: str) -> Response:
     requested = parse_requested_props()
     depth = request.headers.get("Depth", "0")
     root = ET.Element(q(D, "multistatus"))
 
     if kind == "root":
-        root.append(response_for("/dav/", root_props(username), requested))
+        root.append(response_for("/dav/", root_props(username, role), requested))
         if depth != "0":
-            root.append(response_for(f"/dav/{quote(username)}/", principal_props(username), requested))
+            root.append(response_for(f"/dav/{quote(username)}/", principal_props(username, role), requested))
     elif kind == "principal":
-        root.append(response_for(f"/dav/{quote(username)}/", principal_props(username), requested))
+        root.append(response_for(f"/dav/{quote(username)}/", principal_props(username, role), requested))
         if depth != "0":
-            root.append(response_for(f"/dav/{quote(username)}/contacts/", collection_props(username), requested))
+            root.append(response_for(f"/dav/{quote(username)}/contacts/", collection_props(username, role), requested))
     elif kind == "collection":
-        root.append(response_for(f"/dav/{quote(username)}/contacts/", collection_props(username), requested))
+        root.append(response_for(f"/dav/{quote(username)}/contacts/", collection_props(username, role), requested))
         if depth != "0":
             for contact in store.list_contacts():
-                root.append(response_for(contact_href(username, contact["uid"]), contact_props(contact), requested))
+                root.append(
+                    response_for(
+                        contact_href(username, contact["uid"]),
+                        contact_props(contact, role),
+                        requested,
+                    )
+                )
     elif kind == "contact" and uid:
         contact = store.get_contact(uid)
         if not contact:
             abort(404)
-        root.append(response_for(contact_href(username, contact["uid"]), contact_props(contact), requested))
+        root.append(response_for(contact_href(username, contact["uid"]), contact_props(contact, role), requested))
     else:
         abort(404)
     return xml_response(root)
@@ -454,7 +593,13 @@ def report_requested_props(root: ET.Element) -> tuple[set[str] | None, bool]:
     return requested, q(C, "address-data") in requested
 
 
-def handle_report(username: str) -> Response:
+def invalid_sync_token_response() -> Response:
+    error = ET.Element(q(D, "error"))
+    ET.SubElement(error, q(D, "valid-sync-token"))
+    return xml_response(error, status=403)
+
+
+def handle_report(username: str, role: str) -> Response:
     try:
         report = ET.fromstring(request.get_data() or b"<empty />")
     except ET.ParseError:
@@ -464,27 +609,71 @@ def handle_report(username: str) -> Response:
     multistatus = ET.Element(q(D, "multistatus"))
     name = local_name(report.tag)
 
-    if name in {"addressbook-query", "sync-collection"}:
+    if name == "addressbook-query":
         for contact in store.list_contacts():
             multistatus.append(
-                response_for(contact_href(username, contact["uid"]), contact_props(contact, include_card), requested)
+                response_for(
+                    contact_href(username, contact["uid"]),
+                    contact_props(contact, role, include_card),
+                    requested,
+                )
             )
-        if name == "sync-collection":
-            sync_token = ET.SubElement(multistatus, q(D, "sync-token"))
-            sync_token.text = store.collection_token()
+        return xml_response(multistatus)
+
+    if name == "sync-collection":
+        token_node = report.find(q(D, "sync-token"))
+        token_text = token_node.text if token_node is not None else None
+        since = store.parse_sync_token(token_text)
+        if since == -1:
+            return invalid_sync_token_response()
+        if since is None:
+            for contact in store.list_contacts():
+                multistatus.append(
+                    response_for(
+                        contact_href(username, contact["uid"]),
+                        contact_props(contact, role, include_card),
+                        requested,
+                    )
+                )
+        else:
+            current = store.revision()
+            if since > current:
+                return invalid_sync_token_response()
+            for change in store.changes_since(since):
+                href_value = contact_href(username, change["uid"])
+                if change["action"] == "delete":
+                    multistatus.append(not_found_response(href_value))
+                    continue
+                contact = store.get_contact(change["uid"])
+                if contact:
+                    multistatus.append(
+                        response_for(
+                            href_value,
+                            contact_props(contact, role, include_card),
+                            requested,
+                        )
+                    )
+                else:
+                    multistatus.append(not_found_response(href_value))
+        sync_token = ET.SubElement(multistatus, q(D, "sync-token"))
+        sync_token.text = store.collection_token()
         return xml_response(multistatus)
 
     if name == "addressbook-multiget":
         hrefs = [node.text or "" for node in report.findall(q(D, "href"))]
         for item in hrefs:
-            uid = unquote(Path(item).name)
-            if uid.endswith(".vcf"):
-                uid = uid[:-4]
+            uid = uid_from_href(item)
+            if not uid:
+                multistatus.append(not_found_response(item or "/dav/missing"))
+                continue
+            target = contact_href(username, uid)
             contact = store.get_contact(uid)
             if contact:
                 multistatus.append(
-                    response_for(contact_href(username, contact["uid"]), contact_props(contact, include_card), requested)
+                    response_for(target, contact_props(contact, role, include_card), requested)
                 )
+            else:
+                multistatus.append(not_found_response(target))
         return xml_response(multistatus)
 
     return Response("Unsupported REPORT", 400)
@@ -614,4 +803,3 @@ USERS_TEMPLATE = BASE_STYLE + """
 
 
 app = create_app()
-

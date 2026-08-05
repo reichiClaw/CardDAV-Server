@@ -161,18 +161,14 @@ CONTACT_EMPLOYEE_PASSWORD=replace-with-another-long-random-password
 For a reverse-proxy installation, expose only local port `8080` and do not
 publish container ports `80` and `443` directly to the internet.
 
-Edit `docker-compose.yml` ports to look like this:
+`8080` is already bound to `127.0.0.1` in `docker-compose.yml`. Remove or
+comment the public `80`/`443` mappings in reverse-proxy mode:
 
 ```yaml
 ports:
+  # - "80:80"
+  # - "443:443"
   - "127.0.0.1:8080:8080"
-```
-
-Remove or comment these lines in reverse-proxy mode:
-
-```yaml
-# - "80:80"
-# - "443:443"
 ```
 
 Then start the container:
@@ -451,7 +447,10 @@ Restore by stopping the container and extracting the archive back into the volum
 - Use one account per employee or per device group.
 - Use long random passwords.
 - Keep admin credentials separate from employee sync credentials.
-- Employee accounts are server-side read-only.
+- Employee accounts are server-side read-only: CardDAV `PUT`/`DELETE` return `403`, `OPTIONS` omits write methods, and WebDAV privileges advertise read-only access.
+- Admin writes honor `If-Match` / `If-None-Match` to avoid silent overwrites.
+- Deleted contacts are soft-deleted and published as CardDAV sync tombstones so phones drop them.
+- Port `8080` is bound to `127.0.0.1` for local/reverse-proxy mode; do not publish it publicly without TLS.
 - Delete old employee accounts when people leave.
 - Keep the host and Docker updated.
 - Do not expose the SQLite database directly.
